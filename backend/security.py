@@ -88,11 +88,37 @@ class RateLimitInfoMiddleware(BaseHTTPMiddleware):
         response = await call_next(request)
 
         # Add rate limit headers if available
-        if hasattr(request.state, "view_rate_limit"):
-            limit = request.state.view_rate_limit
-            response.headers["X-RateLimit-Limit"] = str(limit.limit)
-            response.headers["X-RateLimit-Remaining"] = str(limit.remaining)
-            response.headers["X-RateLimit-Reset"] = str(limit.reset)
+        try:
+            limit_info = getattr(request.state, "view_rate_limit", None)
+            if limit_info is not None:
+                # slowapi may store this as an object or a tuple
+                limit_val = remaining = reset = None
+
+                # Object style (has attributes)
+                if hasattr(limit_info, "limit") or hasattr(limit_info, "remaining"):
+                    limit_val = getattr(limit_info, "limit", None)
+                    remaining = getattr(limit_info, "remaining", None)
+                    reset = getattr(limit_info, "reset", None) or getattr(
+                        limit_info, "reset_at", None
+                    )
+                # Tuple/list style: (limit, remaining, reset)
+                elif isinstance(limit_info, (tuple, list)):
+                    if len(limit_info) >= 1:
+                        limit_val = limit_info[0]
+                    if len(limit_info) >= 2:
+                        remaining = limit_info[1]
+                    if len(limit_info) >= 3:
+                        reset = limit_info[2]
+
+                if limit_val is not None:
+                    response.headers["X-RateLimit-Limit"] = str(limit_val)
+                if remaining is not None:
+                    response.headers["X-RateLimit-Remaining"] = str(remaining)
+                if reset is not None:
+                    response.headers["X-RateLimit-Reset"] = str(reset)
+        except Exception:
+            # Never let header enrichment break the request
+            pass
 
         return response
 

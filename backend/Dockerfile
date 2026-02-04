@@ -6,7 +6,11 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y \
     gcc \
     curl \
+    ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+# Ensure CA certificates are up to date for HTTPS requests
+RUN update-ca-certificates
 
 # Copy requirements first for better caching
 COPY requirements.txt .
