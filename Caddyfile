@@ -1,0 +1,53 @@
+# Caddy configuration for Anime Roast Generator
+# Domain: anime-roast-generator.duckdns.org
+# Email: oddava@proton.me
+
+{
+    email oddava@proton.me
+    auto_https off
+}
+
+# HTTP to HTTPS redirect
+http://anime-roast-generator.duckdns.org {
+    redir https://{host}{uri}
+}
+
+# Main site with HTTPS
+https://anime-roast-generator.duckdns.org {
+    # Enable gzip compression
+    encode gzip
+
+    # API routes - proxy to backend
+    handle_path /api/* {
+        reverse_proxy backend:8000 {
+            header_up Host {host}
+            header_up X-Real-IP {remote}
+            header_up X-Forwarded-For {remote}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Health check endpoint
+    handle /health {
+        reverse_proxy backend:8000
+    }
+
+    # Static files - proxy to frontend nginx
+    handle {
+        reverse_proxy frontend:80 {
+            header_up Host {host}
+            header_up X-Real-IP {remote}
+            header_up X-Forwarded-For {remote}
+            header_up X-Forwarded-Proto {scheme}
+        }
+    }
+
+    # Logging
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 10MB
+            roll_keep 5
+            roll_keep_for 720h
+        }
+    }
+}
