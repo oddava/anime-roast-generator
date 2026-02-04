@@ -6,7 +6,9 @@ import StatsCard from './components/StatsCard';
 import SkeletonLoader from './components/SkeletonLoader';
 import RoastHistory, { MAX_HISTORY_ITEMS, STORAGE_KEY } from './components/RoastHistory';
 
-const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+// API URL configuration for Vercel deployment
+// On Vercel, API is served from same origin, so we use relative path
+const API_URL = import.meta.env.VITE_API_URL || '';
 
 function App() {
   const [animeName, setAnimeName] = useState('');

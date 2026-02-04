@@ -1,5 +1,6 @@
 import re
 import logging
+import os
 from typing import Optional
 from datetime import datetime
 from fastapi import Request, HTTPException
@@ -31,6 +32,24 @@ class SecurityManager:
         r"javascript:",
         r"on\w+\s*=",
     ]
+
+    # Redis client for distributed rate limiting (Vercel/Upstash)
+    _redis_client = None
+
+    @classmethod
+    def get_redis_client(cls):
+        """Get or create Redis client for rate limiting."""
+        if cls._redis_client is None:
+            redis_url = os.getenv("UPSTASH_REDIS_URL") or os.getenv("REDIS_URL")
+            if redis_url:
+                try:
+                    import redis
+
+                    cls._redis_client = redis.from_url(redis_url)
+                    logger.info("Redis client initialized for rate limiting")
+                except Exception as e:
+                    logger.warning(f"Failed to connect to Redis: {e}")
+        return cls._redis_client
 
     @classmethod
     def validate_anime_name(cls, name: str) -> str:
@@ -113,5 +132,16 @@ class SecurityManager:
 
 
 def get_limiter() -> Limiter:
-    """Create and configure rate limiter."""
-    return Limiter(key_func=get_remote_address, default_limits=["10 per minute"])
+    """Create and configure rate limiter with Redis storage if available."""
+    redis_client = SecurityManager.get_redis_client()
+
+    if redis_client:
+        # Use Redis storage for distributed rate limiting (Vercel)
+        return Limiter(
+            key_func=get_remote_address,
+            default_limits=["10 per minute"],
+            storage_uri=os.getenv("UPSTASH_REDIS_URL") or os.getenv("REDIS_URL"),
+        )
+    else:
+        # Fallback to in-memory storage (local development)
+        return Limiter(key_func=get_remote_address, default_limits=["10 per minute"])
