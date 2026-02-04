@@ -21,6 +21,7 @@
     }
   ],
   "env": {
-    "PYTHON_VERSION": "3.13"
+    "PYTHON_VERSION": "3.13",
+    "PYO3_USE_ABI3_FORWARD_COMPATIBILITY": "1"
   }
 }
