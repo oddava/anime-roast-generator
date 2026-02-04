@@ -7,7 +7,9 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies
-RUN npm ci
+# Using npm install because this repo does not include a package-lock.json.
+# npm ci requires a lockfile and fails otherwise.
+RUN npm install --no-audit --no-fund
 
 # Copy source code
 COPY . .
