@@ -1,17 +1,100 @@
+"""Security middleware and utilities for the Anime Roast Generator API."""
+
 import re
 import logging
 import os
+import secrets
+import hashlib
+import time
 from typing import Optional
 from datetime import datetime
 from fastapi import Request, HTTPException
+from fastapi.responses import JSONResponse
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.types import ASGIApp
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+
+class SecurityHeadersMiddleware(BaseHTTPMiddleware):
+    """Add security headers to all responses."""
+
+    def __init__(
+        self,
+        app: ASGIApp,
+        csp_policy: Optional[str] = None,
+    ):
+        super().__init__(app)
+        self.csp_policy = csp_policy or (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: https:; "
+            "font-src 'self'; "
+            "connect-src 'self' https://graphql.anilist.co; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self';"
+        )
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        # Security headers
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Strict-Transport-Security"] = (
+            "max-age=31536000; includeSubDomains"
+        )
+        response.headers["Content-Security-Policy"] = self.csp_policy
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = (
+            "accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()"
+        )
+
+        # Remove server header if present
+        if "Server" in response.headers:
+            del response.headers["Server"]
+
+        return response
+
+
+class RequestIDMiddleware(BaseHTTPMiddleware):
+    """Add unique request ID to each request for tracing."""
+
+    async def dispatch(self, request: Request, call_next):
+        # Generate or get request ID
+        request_id = request.headers.get("X-Request-ID", secrets.token_hex(16))
+        request.state.request_id = request_id
+
+        # Add to response headers
+        response = await call_next(request)
+        response.headers["X-Request-ID"] = request_id
+
+        return response
+
+
+class RateLimitInfoMiddleware(BaseHTTPMiddleware):
+    """Add rate limit information to responses."""
+
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+
+        # Add rate limit headers if available
+        if hasattr(request.state, "view_rate_limit"):
+            limit = request.state.view_rate_limit
+            response.headers["X-RateLimit-Limit"] = str(limit.limit)
+            response.headers["X-RateLimit-Remaining"] = str(limit.remaining)
+            response.headers["X-RateLimit-Reset"] = str(limit.reset)
+
+        return response
 
 
 class SecurityManager:
@@ -34,6 +117,21 @@ class SecurityManager:
         r"<script[^>]*>",
         r"javascript:",
         r"on\w+\s*=",
+    ]
+
+    # Prompt injection patterns for AI sanitization
+    PROMPT_INJECTION_PATTERNS = [
+        r"ignore\s+(previous|above|all)\s+(instructions|prompt)",
+        r"disregard\s+(previous|above|all)",
+        r"system\s*:",
+        r"user\s*:",
+        r"assistant\s*:",
+        r"you\s+are\s+now",
+        r"new\s+instructions",
+        r"forget\s+(everything|all|previous)",
+        r"act\s+as\s+(if\s+)?you\s+(are|were)",
+        r"pretend\s+(to\s+be|you\s+are)",
+        r"roleplay\s+as",
     ]
 
     # Redis client for distributed rate limiting (Vercel/Upstash)
@@ -97,6 +195,99 @@ class SecurityManager:
         return name
 
     @classmethod
+    def sanitize_for_prompt(cls, text: str, max_length: int = 2000) -> str:
+        """
+        Sanitize text for use in AI prompts to prevent prompt injection.
+
+        Args:
+            text: Input text to sanitize
+            max_length: Maximum allowed length
+
+        Returns:
+            Sanitized text safe for AI prompts
+        """
+        if not text:
+            return ""
+
+        # Truncate to prevent token abuse
+        if len(text) > max_length:
+            text = text[:max_length] + "..."
+
+        # Remove control characters except newlines
+        text = "".join(
+            char
+            for char in text
+            if char == "\n" or (ord(char) >= 32 and ord(char) <= 126) or ord(char) > 127
+        )
+
+        # Check for prompt injection attempts
+        lower_text = text.lower()
+        for pattern in cls.PROMPT_INJECTION_PATTERNS:
+            if re.search(pattern, lower_text):
+                logger.warning("Potential prompt injection attempt detected")
+                # Remove the suspicious text section
+                text = re.sub(pattern, "[REMOVED]", text, flags=re.IGNORECASE)
+
+        # Escape special characters that could be used for injection
+        text = text.replace("{", "{{").replace("}", "}}")
+
+        return text.strip()
+
+    @classmethod
+    def sanitize_review_context(cls, review_context: Optional[dict]) -> Optional[dict]:
+        """
+        Sanitize review context data before passing to AI.
+
+        Args:
+            review_context: Dictionary containing review analysis data
+
+        Returns:
+            Sanitized review context or None if input is None
+        """
+        if not review_context:
+            return None
+
+        sanitized = {}
+
+        # Sanitize simple fields
+        if "review_count" in review_context:
+            sanitized["review_count"] = min(int(review_context["review_count"]), 100)
+
+        if "average_rating" in review_context:
+            try:
+                rating = float(review_context["average_rating"])
+                sanitized["average_rating"] = max(0, min(rating, 10))
+            except (ValueError, TypeError):
+                sanitized["average_rating"] = None
+
+        # Sanitize text lists
+        if "top_criticisms" in review_context:
+            criticisms = review_context["top_criticisms"]
+            if isinstance(criticisms, list):
+                sanitized["top_criticisms"] = [
+                    cls.sanitize_for_prompt(str(c), max_length=100)
+                    for c in criticisms[:5]
+                ]
+            else:
+                sanitized["top_criticisms"] = []
+
+        if "summary" in review_context:
+            sanitized["summary"] = cls.sanitize_for_prompt(
+                str(review_context["summary"]), max_length=500
+            )
+
+        if "spicy_quotes" in review_context:
+            quotes = review_context.get("spicy_quotes", [])
+            if isinstance(quotes, list):
+                sanitized["spicy_quotes"] = [
+                    cls.sanitize_for_prompt(str(q), max_length=200) for q in quotes[:2]
+                ]
+            else:
+                sanitized["spicy_quotes"] = []
+
+        return sanitized
+
+    @classmethod
     def log_request(
         cls,
         request: Request,
@@ -115,11 +306,16 @@ class SecurityManager:
         """
         client_ip = get_remote_address(request)
         user_agent = request.headers.get("user-agent", "unknown")
+        request_id = getattr(request.state, "request_id", "unknown")
         timestamp = datetime.utcnow().isoformat()
+
+        # Hash IP for privacy
+        ip_hash = hashlib.sha256(client_ip.encode()).hexdigest()[:16]
 
         log_data = {
             "timestamp": timestamp,
-            "ip": client_ip,
+            "request_id": request_id,
+            "ip_hash": ip_hash,
             "anime": anime_name[:50],  # Truncate for privacy
             "success": success,
             "user_agent": user_agent[:100],  # Truncate
@@ -139,7 +335,7 @@ def get_limiter() -> Limiter:
     redis_client = SecurityManager.get_redis_client()
 
     if redis_client:
-        # Use Redis storage for distributed rate limiting (Vercel)
+        # Use Redis storage for distributed rate limiting
         return Limiter(
             key_func=get_remote_address,
             default_limits=["10 per minute"],
@@ -147,4 +343,5 @@ def get_limiter() -> Limiter:
         )
     else:
         # Fallback to in-memory storage (local development)
+        logger.warning("Using in-memory rate limiting - deploy Redis for production")
         return Limiter(key_func=get_remote_address, default_limits=["10 per minute"])

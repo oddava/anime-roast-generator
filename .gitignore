@@ -62,3 +62,12 @@ logs/
 
 # Docker
 .dockerignore
+
+# Secrets
+*.pem
+*.key
+secrets/
+
+# Production environment (never commit)
+.env.prod
+.env.production
