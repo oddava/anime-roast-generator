@@ -17,9 +17,8 @@ https://{$DOMAIN} {
     # Enable gzip compression
     encode gzip
 
-    # API routes - proxy to backend (preserve /api prefix)
-    # Use 'handle' instead of 'handle_path' to avoid stripping '/api'
-    handle /api/* {
+    # API routes - proxy to backend
+    handle_path /api/* {
         reverse_proxy backend:8000 {
             header_up Host {host}
             header_up X-Real-IP {remote}
