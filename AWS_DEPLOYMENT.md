@@ -61,7 +61,37 @@ cp .env.prod.example .env.prod
 nano .env.prod
 ```
 
-Fill in your `GEMINI_API_KEY` and other settings.
+**Required settings:**
+- `DOMAIN` - Your domain name (e.g., `anime-roast-generator.duckdns.org`)
+- `ACME_EMAIL` - Email for SSL certificates (e.g., `oddava@proton.me`)
+- `GEMINI_API_KEY` - Your Google Gemini API key
+
+**Optional settings:**
+- `GEMINI_MODEL` - Model to use (default: `gemini-2.0-flash-lite`)
+- `RATE_LIMIT_PER_MINUTE` - API rate limiting (default: `10`)
+- `UPSTASH_REDIS_URL` - Redis URL for distributed rate limiting (optional)
+
+### Changing Domain or Email
+
+To change your domain or email later:
+
+1. Edit `.env.prod`:
+   ```bash
+   nano .env.prod
+   ```
+
+2. Update the values:
+   ```
+   DOMAIN=your-new-domain.com
+   ACME_EMAIL=your-new-email@example.com
+   ```
+
+3. Redeploy:
+   ```bash
+   ./deploy.sh
+   ```
+
+Caddy will automatically obtain new SSL certificates for the new domain.
 
 ### 6. Deploy the application
 
@@ -187,4 +217,4 @@ For issues or questions:
 
 Caddy automatically handles SSL certificates via Let's Encrypt. No manual configuration needed!
 
-Your application should now be accessible at: https://anime-roast-generator.duckdns.org
+Your application should now be accessible at your configured domain (e.g., https://anime-roast-generator.duckdns.org)

@@ -10,7 +10,7 @@ services:
     env_file:
       - .env.prod
     environment:
-      - FRONTEND_URL=https://anime-roast-generator.duckdns.org
+      - FRONTEND_URL=https://${DOMAIN}
     networks:
       - app-network
     healthcheck:
@@ -48,6 +48,8 @@ services:
     ports:
       - "80:80"
       - "443:443"
+    env_file:
+      - .env.prod
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data

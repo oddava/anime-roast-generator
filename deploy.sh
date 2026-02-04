@@ -20,6 +20,20 @@ if [ ! -f .env.prod ]; then
     exit 1
 fi
 
+# Load environment variables
+export $(grep -v '^#' .env.prod | xargs)
+
+# Check required variables
+if [ -z "$DOMAIN" ]; then
+    echo -e "${RED}Error: DOMAIN is not set in .env.prod${NC}"
+    exit 1
+fi
+
+if [ -z "$ACME_EMAIL" ]; then
+    echo -e "${RED}Error: ACME_EMAIL is not set in .env.prod${NC}"
+    exit 1
+fi
+
 # Pull latest changes
 echo -e "${YELLOW}📥 Pulling latest changes...${NC}"
 git pull origin main
@@ -53,7 +67,7 @@ fi
 # Display status
 echo -e "${GREEN}✅ Deployment completed successfully!${NC}"
 echo ""
-echo -e "${GREEN}🌐 Application is running at: https://anime-roast-generator.duckdns.org${NC}"
+echo -e "${GREEN}🌐 Application is running at: https://${DOMAIN}${NC}"
 echo ""
 echo -e "${YELLOW}📊 Container status:${NC}"
 docker-compose -f docker-compose.prod.yml ps

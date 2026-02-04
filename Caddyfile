@@ -1,19 +1,19 @@
 # Caddy configuration for Anime Roast Generator
-# Domain: anime-roast-generator.duckdns.org
-# Email: oddava@proton.me
+# Uses environment variables from .env file
+# Domain: {$DOMAIN}
+# Email: {$ACME_EMAIL}
 
 {
-    email oddava@proton.me
-    auto_https off
+    email {$ACME_EMAIL}
 }
 
 # HTTP to HTTPS redirect
-http://anime-roast-generator.duckdns.org {
+http://{$DOMAIN} {
     redir https://{host}{uri}
 }
 
 # Main site with HTTPS
-https://anime-roast-generator.duckdns.org {
+https://{$DOMAIN} {
     # Enable gzip compression
     encode gzip
 
