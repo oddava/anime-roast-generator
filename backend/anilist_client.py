@@ -51,16 +51,77 @@ query ($id: Int) {
     episodes
     seasonYear
     averageScore
+    meanScore
+    popularity
+    favourites
     format
+    source
+    status
+    season
     description
     genres
     tags {
       name
       rank
+      category
     }
     studios {
       nodes {
         name
+      }
+    }
+    staff {
+      edges {
+        node {
+          name {
+            full
+          }
+        }
+        role
+      }
+    }
+    characters {
+      edges {
+        node {
+          name {
+            full
+          }
+        }
+        role
+      }
+    }
+    relations {
+      edges {
+        node {
+          id
+          title {
+            romaji
+          }
+          format
+        }
+        relationType
+      }
+    }
+    rankings {
+      rank
+      type
+      context
+    }
+    stats {
+      scoreDistribution {
+        score
+        amount
+      }
+      statusDistribution {
+        status
+        amount
+      }
+    }
+    trends {
+      nodes {
+        date
+        trending
+        popularity
       }
     }
   }
@@ -206,6 +267,55 @@ class AniListClient:
             title = media.get("title", {})
             cover = media.get("coverImage", {})
             studios = media.get("studios", {}).get("nodes", [])
+            staff_edges = media.get("staff", {}).get("edges", [])
+            char_edges = media.get("characters", {}).get("edges", [])
+            relations = media.get("relations", {}).get("edges", [])
+            rankings = media.get("rankings", [])
+            stats = media.get("stats", {})
+
+            # Extract staff (directors, writers, etc.)
+            staff_list = []
+            for edge in staff_edges[:10]:  # Limit to first 10
+                node = edge.get("node", {})
+                name = node.get("name", {})
+                staff_list.append({"name": name.get("full"), "role": edge.get("role")})
+
+            # Extract main characters
+            characters = []
+            for edge in char_edges[:8]:  # Limit to first 8
+                node = edge.get("node", {})
+                name = node.get("name", {})
+                characters.append(
+                    {
+                        "name": name.get("full"),
+                        "role": edge.get("role"),  # MAIN, SUPPORTING
+                    }
+                )
+
+            # Extract related anime
+            related = []
+            for edge in relations[:5]:
+                node = edge.get("node", {})
+                related.append(
+                    {
+                        "id": node.get("id"),
+                        "title": node.get("title", {}).get("romaji"),
+                        "format": node.get("format"),
+                        "relation": edge.get("relationType"),
+                    }
+                )
+
+            # Get score distribution for controversy detection
+            score_dist = stats.get("scoreDistribution", [])
+            score_breakdown = {item["score"]: item["amount"] for item in score_dist}
+
+            # Calculate controversy score (high variance = controversial)
+            controversy_score = self._calculate_controversy(score_breakdown)
+
+            # Get top ranked categories
+            top_rankings = [
+                {"rank": r["rank"], "context": r["context"]} for r in rankings[:5]
+            ]
 
             return {
                 "id": media.get("id"),
@@ -221,16 +331,52 @@ class AniListClient:
                 },
                 "episodes": media.get("episodes"),
                 "year": media.get("seasonYear"),
+                "season": media.get("season"),
                 "score": media.get("averageScore"),
+                "meanScore": media.get("meanScore"),
+                "popularity": media.get("popularity"),
+                "favourites": media.get("favourites"),
                 "format": media.get("format"),
+                "source": media.get("source"),
+                "status": media.get("status"),
                 "description": media.get("description"),
                 "genres": media.get("genres", []),
                 "studios": [s.get("name") for s in studios if s.get("name")],
+                "staff": staff_list,
+                "mainCharacters": characters,
+                "relations": related,
+                "rankings": top_rankings,
+                "controversyScore": controversy_score,
+                "scoreDistribution": score_breakdown,
             }
 
         except Exception as e:
             logger.error(f"Error fetching anime by ID: {e}")
             return None
+
+    def _calculate_controversy(self, score_dist: dict) -> float:
+        """Calculate how controversial an anime is based on score distribution.
+
+        Returns a score 0-100 where higher means more controversial.
+        """
+        if not score_dist or len(score_dist) < 5:
+            return 0.0
+
+        total = sum(score_dist.values())
+        if total == 0:
+            return 0.0
+
+        # Calculate percentage of extreme scores (1-3 and 9-10)
+        low_scores = sum(score_dist.get(i, 0) for i in [1, 2, 3])
+        high_scores = sum(score_dist.get(i, 0) for i in [9, 10])
+
+        # Controversy = when both extremes are significant
+        low_pct = low_scores / total
+        high_pct = high_scores / total
+
+        # Love-it-or-hate-it indicator
+        controversy = min(low_pct, high_pct) * 200  # Scale to 0-100 roughly
+        return min(controversy, 100)
 
     def get_display_title(self, anime: dict) -> str:
         """Get the best display title for an anime.

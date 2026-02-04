@@ -32,7 +32,9 @@ from security import (
     RateLimitInfoMiddleware,
 )
 from anilist_client import get_anilist_client, close_anilist_client
-from review_analyzer import ReviewAnalyzer
+from enhanced_review_analyzer import EnhancedReviewAnalyzer
+from simple_context_builder import SimpleContextBuilder
+from roast_cleaner import RoastCleaner
 
 
 # Configure structured logging
@@ -140,60 +142,56 @@ def generate_cache_key(anime_name: str, review_context: Optional[dict]) -> str:
 
 
 def generate_roast_and_stats_prompt(
-    anime_name: str, review_context: Optional[dict] = None
+    anime_name: str,
+    anime_data: Optional[dict] = None,
+    review_context: Optional[dict] = None,
 ) -> str:
-    """Generate the prompt for Gemini to create a roast and stats."""
+    """Generate the prompt for Gemini to create a roast and stats.
+
+    Uses simplified qualitative context for natural, witty roasts.
+    """
     # Sanitize anime name for prompt
     safe_anime_name = SecurityManager.sanitize_for_prompt(anime_name)
 
-    base_prompt = f"""Generate a witty, sarcastic roast for the anime "{safe_anime_name}" AND provide humorous statistics."""
+    # Build simplified qualitative context
+    if anime_data:
+        data_context = SimpleContextBuilder.build_context(anime_data, review_context)
+        constraints = SimpleContextBuilder.build_constraints()
+    else:
+        data_context = f"Anime: {safe_anime_name}\nNo detailed data available."
+        constraints = "=== ROASTING RULES ===\n1. Keep it generic but funny\n2. Focus on common anime tropes\n3. Don't make specific claims about quality"
 
-    if review_context and review_context.get("review_count", 0) > 0:
-        # Sanitize all review context data
-        safe_summary = SecurityManager.sanitize_for_prompt(
-            review_context.get("summary", "Mixed reviews"), max_length=200
-        )
-        safe_criticisms = [
-            SecurityManager.sanitize_for_prompt(c, max_length=50)
-            for c in review_context.get("top_criticisms", [])[:5]
-        ]
-        avg_rating = review_context.get("average_rating", "N/A")
+    prompt = f"""You are a witty anime critic writing a satirical roast. Write like a sarcastic friend roasting a buddy's questionable taste.
 
-        base_prompt += f"""
+=== CONTEXT (use as background, don't quote directly) ===
+{data_context}
 
-COMMUNITY DATA FROM ANILIST REVIEWS:
-- Reviews Analyzed: {review_context["review_count"]}
-- Average Rating: {avg_rating}/10
-- Top Criticisms: {", ".join(safe_criticisms)}
-- Community Sentiment: {safe_summary}
+{constraints}
 
-Use this community data to make your roast more accurate and specific. Reference actual complaints fans have made."""
+=== WRITING STYLE ===
+- Conversational and natural, not robotic
+- Witty and sarcastic but playful
+- Mock tropes and expectations, not data points
+- Use irony and hyperbole
+- Reference community sentiment without quoting statistics
+- The roast should be quotable and funny, not a data report
 
-    base_prompt += """
-
-Return your response in this exact format:
+Return in this format:
 
 ROAST:
-[Your 100-150 word roast here - funny, playful and chaotic NOT mean-spirited. Focus on anime tropes, fanbase stereotypes, plot inconsistencies, overused clichés. Written in a comedic, roasting style."""
-
-    if review_context and review_context.get("review_count", 0) > 0:
-        base_prompt += """ Use current anime community slang like "mid", "cope", "carried by", "fell off", "peaked", etc. Reference specific criticisms from the community data above."""
-
-    base_prompt += """]
+[Your natural, conversational roast here - 100-150 words]
 
 STATS:
-{
-  "horniness_level": [0-100, fan service/ecchi content],
-  "plot_armor_thickness": [0-100, protagonist invincibility],
-  "filler_hell": [0-100, percentage of filler episodes],
-  "power_creep": [0-100, power scaling absurdity],
-  "cringe_factor": [0-100, awkward moments and tropes],
-  "fan_toxicity": [0-100, fanbase intensity level]
-}
+{{
+  "horniness_level": 0-100,
+  "plot_armor_thickness": 0-100,
+  "filler_hell": 0-100,
+  "power_creep": 0-100,
+  "cringe_factor": 0-100,
+  "fan_toxicity": 0-100
+}}"""
 
-Make the stats exaggerated and funny based on real anime tropes. All values must be integers between 0 and 100."""
-
-    return base_prompt
+    return prompt
 
 
 def parse_roast_response(response_text: str) -> tuple[str, dict]:
@@ -323,7 +321,8 @@ async def generate_roast(request: Request, roast_request: RoastRequest):
         cover_image = None
         anime_id = None
         anime_details = None
-        review_analysis = None
+        anime_data = None
+        enhanced_context = None
         reviews_used = 0
 
         if roast_request.anime_id:
@@ -338,22 +337,24 @@ async def generate_roast(request: Request, roast_request: RoastRequest):
                 reviews = await client.get_anime_reviews(
                     roast_request.anime_id, per_page=25
                 )
-                if reviews:
-                    analysis_data = ReviewAnalyzer.create_review_summary(reviews)
-                    # Sanitize review data before using in AI prompt
-                    sanitized_data = SecurityManager.sanitize_review_context(
-                        analysis_data
+                if reviews and anime_data:
+                    # Use enhanced analyzer with anime data context
+                    enhanced_context = (
+                        EnhancedReviewAnalyzer.format_enhanced_review_context(
+                            reviews, anime_data
+                        )
                     )
-                    if sanitized_data:
-                        review_analysis = ReviewAnalysis(**sanitized_data)
                     reviews_used = len(reviews)
-                    logger.info(f"[{request_id}] Fetched {reviews_used} reviews")
+                    logger.info(
+                        f"[{request_id}] Fetched {reviews_used} reviews, found {len(enhanced_context.get('verified_complaints', []))} verified complaints"
+                    )
+                else:
+                    enhanced_context = None
             except Exception as e:
                 logger.warning(f"[{request_id}] Could not fetch details: {e}")
 
         # Check cache first
-        review_context = review_analysis.dict() if review_analysis else None
-        cache_key = generate_cache_key(anime_name, review_context)
+        cache_key = generate_cache_key(anime_name, enhanced_context)
         cached_response = get_cached_response(cache_key)
 
         if cached_response:
@@ -369,28 +370,70 @@ async def generate_roast(request: Request, roast_request: RoastRequest):
                 success=True,
             )
 
-        # Generate roast with timeout
+        # Generate roast with validation and retry
         model = genai.GenerativeModel(settings.gemini_model)
-        prompt = generate_roast_and_stats_prompt(anime_name, review_context)
+        prompt = generate_roast_and_stats_prompt(
+            anime_name, anime_data, enhanced_context
+        )
 
-        try:
-            # Add 30 second timeout for Gemini API
-            response = await asyncio.wait_for(
-                asyncio.to_thread(model.generate_content, prompt), timeout=30.0
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"[{request_id}] Gemini API timeout")
-            raise HTTPException(
-                status_code=504, detail="AI generation timed out. Please try again."
-            )
+        max_retries = 2
+        roast_text = None
+        stats_data = None
+        validation_issues = []
 
-        if not response or not response.text:
+        for attempt in range(max_retries + 1):
+            try:
+                # Add 30 second timeout for Gemini API
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(model.generate_content, prompt), timeout=30.0
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    f"[{request_id}] Gemini API timeout (attempt {attempt + 1})"
+                )
+                if attempt == max_retries:
+                    raise HTTPException(
+                        status_code=504,
+                        detail="AI generation timed out. Please try again.",
+                    )
+                continue
+
+            if not response or not response.text:
+                if attempt == max_retries:
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Failed to generate roast - empty response from AI",
+                    )
+                continue
+
+            current_roast, current_stats = parse_roast_response(response.text)
+
+            # Clean statistical language from roast
+            current_roast = RoastCleaner.clean_roast(current_roast)
+
+            # Check if still has statistics after cleaning
+            if RoastCleaner.has_statistics(current_roast) and attempt < max_retries:
+                logger.warning(
+                    f"[{request_id}] Roast still has statistics after cleaning, retrying (attempt {attempt + 1})"
+                )
+                # Add stronger constraint for retry
+                prompt += "\n\nIMPORTANT: Remove all percentages, review counts, and exact scores. Write naturally without statistics."
+                continue
+
+            roast_text = current_roast
+            stats_data = current_stats
+            break
+
+        # Ensure we have valid roast data
+        if roast_text is None:
             raise HTTPException(
                 status_code=500,
-                detail="Failed to generate roast - empty response from AI",
+                detail="Failed to generate a valid roast after multiple attempts",
             )
 
-        roast_text, stats_data = parse_roast_response(response.text)
+        # Ensure we have valid stats
+        if stats_data is None:
+            stats_data = _get_default_stats()
 
         stats = AnimeStats(
             horniness_level=stats_data.get("horniness_level", 50),
