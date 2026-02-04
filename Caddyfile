@@ -18,7 +18,7 @@ https://{$DOMAIN} {
     encode gzip
 
     # API routes - proxy to backend
-    handle_path /api/* {
+    handle /api/* {
         reverse_proxy backend:8000 {
             header_up Host {host}
             header_up X-Real-IP {remote}
