@@ -19,7 +19,10 @@ class SecurityManager:
 
     # Regex patterns for input validation
     # Allow alphanumeric, spaces, and common punctuation used in anime titles
-    ANIME_NAME_PATTERN = re.compile(r"^[\w\s\-':!?.(),\[\]{}\"]{1,100}$")
+    # Includes Unicode smart quotes (U+2018, U+2019) that AniList uses
+    # Use explicit space character instead of \s to avoid allowing tabs/newlines
+    # Includes forward slash for titles like "Fate/stay night"
+    ANIME_NAME_PATTERN = re.compile(r"^[\w '\u2018\u2019\-:!?.;,()/\[\]{}\"]{1,100}$")
 
     # Forbidden patterns (potential injection attempts)
     # These patterns must be standalone SQL keywords, not part of normal words
