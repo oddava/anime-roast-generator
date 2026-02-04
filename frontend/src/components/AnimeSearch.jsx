@@ -40,7 +40,15 @@ function AnimeSearch({ onSelect, selectedAnime, disabled }) {
         setShowSuggestions(true);
       }
     } catch (err) {
-      setError('Failed to search anime');
+      console.error('Search error:', err);
+      // Provide more helpful error messages
+      let errorMessage = 'Failed to search anime';
+      if (err.message?.includes('Failed to fetch') || err.message?.includes('NetworkError')) {
+        errorMessage = 'Cannot connect to server. Please make sure the backend is running on port 8000.';
+      } else if (err.message) {
+        errorMessage = err.message;
+      }
+      setError(errorMessage);
       setSuggestions([]);
     } finally {
       setLoading(false);
