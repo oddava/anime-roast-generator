@@ -1,0 +1,188 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Orbitron:wght@400;500;600;700;800;900&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: 'Inter', sans-serif;
+  background-color: #0a0a0a;
+  color: #ffffff;
+  min-height: 100vh;
+}
+
+/* Clean dark background */
+.bg-primary {
+  background-color: #0a0a0a;
+}
+
+.bg-secondary {
+  background-color: #141414;
+}
+
+.bg-tertiary {
+  background-color: #1f1f1f;
+}
+
+/* Text colors */
+.text-primary {
+  color: #ffffff;
+}
+
+.text-secondary {
+  color: #a3a3a3;
+}
+
+.text-muted {
+  color: #737373;
+}
+
+/* Border colors */
+.border-default {
+  border-color: #262626;
+}
+
+.border-focus {
+  border-color: #404040;
+}
+
+/* Accent colors */
+.accent {
+  color: #3b82f6;
+}
+
+.bg-accent {
+  background-color: #3b82f6;
+}
+
+.bg-accent-hover:hover {
+  background-color: #2563eb;
+}
+
+/* Custom scrollbar - clean and minimal */
+::-webkit-scrollbar {
+  width: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0a0a0a;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #262626;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #404040;
+}
+
+/* Input focus styles - clean, no glow */
+input:focus {
+  outline: none;
+  border-color: #3b82f6;
+}
+
+/* Button styles - clean transitions */
+button {
+  transition: all 0.2s ease;
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.98);
+}
+
+/* Card styles - solid background, clean border */
+.card {
+  background-color: #141414;
+  border: 1px solid #262626;
+  border-radius: 12px;
+}
+
+/* Roast text styling - prominent and readable */
+.roast-text {
+  font-size: 1.25rem;
+  line-height: 1.8;
+  color: #ffffff;
+  font-weight: 400;
+}
+
+/* Loading spinner - simple rotation */
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.spinner {
+  animation: spin 1s linear infinite;
+}
+
+/* Toast notification - solid background */
+.toast {
+  position: fixed;
+  bottom: 24px;
+  left: 50%;
+  transform: translateX(-50%);
+  background-color: #141414;
+  border: 1px solid #262626;
+  padding: 14px 28px;
+  border-radius: 8px;
+  z-index: 1000;
+  animation: slideUp 0.3s ease-out;
+}
+
+@keyframes slideUp {
+  from {
+    opacity: 0;
+    transform: translateX(-50%) translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+}
+
+/* Animation utilities */
+.animate-fade-in {
+  animation: fadeIn 0.5s ease-out;
+}
+
+.animate-slide-up {
+  animation: slideUpElement 0.5s ease-out;
+}
+
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes slideUpElement {
+  from {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Font utilities */
+.font-anime {
+  font-family: 'Orbitron', sans-serif;
+}
+
+.font-body {
+  font-family: 'Inter', sans-serif;
+}
