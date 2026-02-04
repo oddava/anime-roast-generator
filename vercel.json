@@ -1,6 +1,6 @@
 {
   "version": 2,
-  "buildCommand": "cd frontend && npm install && npm run build",
+  "buildCommand": "export PYO3_USE_ABI3_FORWARD_COMPATIBILITY=1 && cd frontend && npm install && npm run build",
   "outputDirectory": "frontend/dist",
   "framework": "vite",
   "rewrites": [
@@ -19,9 +19,5 @@
         }
       ]
     }
-  ],
-  "env": {
-    "PYTHON_VERSION": "3.13",
-    "PYO3_USE_ABI3_FORWARD_COMPATIBILITY": "1"
-  }
+  ]
 }
