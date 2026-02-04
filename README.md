@@ -59,7 +59,7 @@ anime-roast-generator/
 ### 1. Clone and Setup
 
 ```bash
-git clone <repository-url>
+git clone https://github.com/oddava/anime-roast-generator
 cd anime-roast-generator
 ```
 
