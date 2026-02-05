@@ -41,8 +41,9 @@ dev-restart: ## Restart development services
 # =============================================================================
 
 .PHONY: prod-deploy
-prod-deploy: ## Full production deployment (pull, build, deploy)
+prod-deploy: ## Full production deployment (backup, pull, build, deploy)
 	@echo "🚀 Starting production deployment..."
+	@make pre-deploy-backup
 	git pull origin main
 	make prod-build
 	make prod-up
@@ -186,12 +187,187 @@ redis-info: ## Show Redis info
 	@docker-compose -f $(COMPOSE_PROD) exec $(REDIS_SERVICE) redis-cli INFO
 
 .PHONY: backup
-backup: ## Create backup of Redis data (if persisted)
-	@echo "💾 Creating backup..."
-	@mkdir -p backups
+backup: ## Create backup of Redis data (if persisted) - DEPRECATED: use backup-all
+	@echo "⚠️  This command is deprecated. Use 'make backup-all' instead."
+	@make backup-all
+
+# =============================================================================
+# SQLite Backup & Restore Commands
+# =============================================================================
+
+BACKUP_DIR := backups
+SQLITE_DB := /app/data/comments.db
+MAX_BACKUPS := 30
+
+.PHONY: backup-sqlite
+backup-sqlite: ## Create backup of SQLite database (comments)
+	@echo "💾 Creating SQLite backup..."
+	@mkdir -p $(BACKUP_DIR)
+	@BACKUP_FILE="$(BACKUP_DIR)/comments_$$(date +%Y%m%d_%H%M%S).db.gz"; \
+	docker-compose -f $(COMPOSE_PROD) exec -T $(BACKEND_SERVICE) sh -c 'sqlite3 $(SQLITE_DB) ".backup /tmp/comments_backup.db" && cat /tmp/comments_backup.db' | gzip > $$BACKUP_FILE; \
+	if [ $$? -eq 0 ]; then \
+		echo "✅ Backup created: $$BACKUP_FILE"; \
+		ls -lh $$BACKUP_FILE; \
+	else \
+		echo "❌ Backup failed"; \
+		exit 1; \
+	fi
+	@make backup-rotate
+
+.PHONY: backup-sqlite-hot
+backup-sqlite-hot: ## Create hot backup of SQLite (while running, uses WAL checkpoint)
+	@echo "💾 Creating hot SQLite backup..."
+	@mkdir -p $(BACKUP_DIR)
+	@BACKUP_FILE="$(BACKUP_DIR)/comments_hot_$$(date +%Y%m%d_%H%M%S).db.gz"; \
+	docker-compose -f $(COMPOSE_PROD) exec -T $(BACKEND_SERVICE) sh -c 'sqlite3 $(SQLITE_DB) "PRAGMA wal_checkpoint(TRUNCATE);" && sqlite3 $(SQLITE_DB) ".backup /tmp/comments_backup.db" && cat /tmp/comments_backup.db' | gzip > $$BACKUP_FILE; \
+	if [ $$? -eq 0 ]; then \
+		echo "✅ Hot backup created: $$BACKUP_FILE"; \
+		ls -lh $$BACKUP_FILE; \
+	else \
+		echo "❌ Hot backup failed"; \
+		exit 1; \
+	fi
+	@make backup-rotate
+
+.PHONY: backup-redis
+backup-redis: ## Create backup of Redis data
+	@echo "💾 Creating Redis backup..."
+	@mkdir -p $(BACKUP_DIR)
 	@docker-compose -f $(COMPOSE_PROD) exec $(REDIS_SERVICE) redis-cli BGSAVE
-	@docker run --rm -v anime-roast-generator_redis_data:/data -v $(PWD)/backups:/backup alpine tar czf /backup/redis-backup-$$(date +%Y%m%d-%H%M%S).tar.gz -C /data .
-	@echo "✅ Backup created in backups/"
+	@sleep 2
+	@docker run --rm -v anime-roast-generator_redis_data:/data -v $(PWD)/$(BACKUP_DIR):/backup alpine tar czf /backup/redis_$$(date +%Y%m%d_%H%M%S).tar.gz -C /data . 2>/dev/null
+	@echo "✅ Redis backup created"
+
+.PHONY: backup-all
+backup-all: backup-sqlite backup-redis ## Create backups of both SQLite and Redis
+	@echo "✅ All backups completed"
+
+.PHONY: backup-list
+backup-list: ## List all available backups
+	@echo "📋 Available backups:"
+	@echo ""
+	@echo "SQLite Backups:"
+	@if [ -d $(BACKUP_DIR) ] && [ "$$(ls -A $(BACKUP_DIR)/comments_*.db.gz 2>/dev/null)" ]; then \
+		ls -lh $(BACKUP_DIR)/comments_*.db.gz 2>/dev/null | awk '{printf "  %-20s %s\n", $$9, $$5}'; \
+	else \
+		echo "  (none)"; \
+	fi
+	@echo ""
+	@echo "Redis Backups:"
+	@if [ -d $(BACKUP_DIR) ] && [ "$$(ls -A $(BACKUP_DIR)/redis_*.tar.gz 2>/dev/null)" ]; then \
+		ls -lh $(BACKUP_DIR)/redis_*.tar.gz 2>/dev/null | awk '{printf "  %-20s %s\n", $$9, $$5}'; \
+	else \
+		echo "  (none)"; \
+	fi
+
+.PHONY: backup-rotate
+backup-rotate: ## Remove old backups (keeps last $(MAX_BACKUPS))
+	@echo "🔄 Rotating backups (keeping last $(MAX_BACKUPS))..."
+	@ls -t $(BACKUP_DIR)/comments_*.db.gz 2>/dev/null | tail -n +$$(( $(MAX_BACKUPS) + 1 )) | xargs -r rm -f
+	@ls -t $(BACKUP_DIR)/redis_*.tar.gz 2>/dev/null | tail -n +$$(( $(MAX_BACKUPS) + 1 )) | xargs -r rm -f
+	@echo "✅ Old backups cleaned up"
+
+.PHONY: restore-sqlite
+restore-sqlite: ## Restore SQLite from backup (interactive)
+	@echo "📋 Available SQLite backups:"
+	@ls -1t $(BACKUP_DIR)/comments_*.db.gz 2>/dev/null | head -10 | nl
+	@echo ""
+	@read -p "Enter number of backup to restore (or 'c' to cancel): " choice; \
+	if [ "$$choice" = "c" ] || [ "$$choice" = "C" ]; then \
+		echo "❌ Restore cancelled"; \
+		exit 0; \
+	fi; \
+	BACKUP_FILE=$$(ls -1t $(BACKUP_DIR)/comments_*.db.gz 2>/dev/null | sed -n "$${choice}p"); \
+	if [ -z "$$BACKUP_FILE" ]; then \
+		echo "❌ Invalid selection"; \
+		exit 1; \
+	fi; \
+	echo "⚠️  WARNING: This will replace the current database!"; \
+	read -p "Are you sure? [y/N] " -n 1 -r; \
+	echo; \
+	if [[ $$REPLY =~ ^[Yy]$$ ]]; then \
+		echo "🔄 Stopping backend service..."; \
+		docker-compose -f $(COMPOSE_PROD) stop $(BACKEND_SERVICE); \
+		echo "🔄 Restoring from $$BACKUP_FILE..."; \
+		zcat $$BACKUP_FILE | docker-compose -f $(COMPOSE_PROD) exec -T $(BACKEND_SERVICE) sh -c 'cat > $(SQLITE_DB).tmp && mv $(SQLITE_DB).tmp $(SQLITE_DB)'; \
+		if [ $$? -eq 0 ]; then \
+			echo "✅ Database restored successfully"; \
+		else \
+			echo "❌ Restore failed"; \
+		fi; \
+		echo "🔄 Starting backend service..."; \
+		docker-compose -f $(COMPOSE_PROD) start $(BACKEND_SERVICE); \
+	else \
+		echo "❌ Restore cancelled"; \
+	fi
+
+.PHONY: restore-redis
+restore-redis: ## Restore Redis from backup (interactive)
+	@echo "📋 Available Redis backups:"
+	@ls -1t $(BACKUP_DIR)/redis_*.tar.gz 2>/dev/null | head -10 | nl
+	@echo ""
+	@read -p "Enter number of backup to restore (or 'c' to cancel): " choice; \
+	if [ "$$choice" = "c" ] || [ "$$choice" = "C" ]; then \
+		echo "❌ Restore cancelled"; \
+		exit 0; \
+	fi; \
+	BACKUP_FILE=$$(ls -1t $(BACKUP_DIR)/redis_*.tar.gz 2>/dev/null | sed -n "$${choice}p"); \
+	if [ -z "$$BACKUP_FILE" ]; then \
+		echo "❌ Invalid selection"; \
+		exit 1; \
+	fi; \
+	echo "⚠️  WARNING: This will replace the current Redis data!"; \
+	read -p "Are you sure? [y/N] " -n 1 -r; \
+	echo; \
+	if [[ $$REPLY =~ ^[Yy]$$ ]]; then \
+		echo "🔄 Stopping Redis service..."; \
+		docker-compose -f $(COMPOSE_PROD) stop $(REDIS_SERVICE); \
+		echo "🔄 Restoring from $$BACKUP_FILE..."; \
+		docker run --rm -v anime-roast-generator_redis_data:/data -v $(PWD)/$$BACKUP_FILE:/backup.tar.gz alpine sh -c 'rm -rf /data/* && tar xzf /backup.tar.gz -C /data'; \
+		if [ $$? -eq 0 ]; then \
+			echo "✅ Redis data restored successfully"; \
+		else \
+			echo "❌ Restore failed"; \
+		fi; \
+		echo "🔄 Starting Redis service..."; \
+		docker-compose -f $(COMPOSE_PROD) start $(REDIS_SERVICE); \
+	else \
+		echo "❌ Restore cancelled"; \
+	fi
+
+.PHONY: backup-verify
+backup-verify: ## Verify integrity of latest SQLite backup
+	@echo "🔍 Verifying latest SQLite backup..."
+	@LATEST_BACKUP=$$(ls -t $(BACKUP_DIR)/comments_*.db.gz 2>/dev/null | head -1); \
+	if [ -z "$$LATEST_BACKUP" ]; then \
+		echo "❌ No backups found"; \
+		exit 1; \
+	fi; \
+	echo "Checking: $$LATEST_BACKUP"; \
+	zcat $$LATEST_BACKUP | docker run --rm -i alpine sh -c 'cat > /tmp/test.db && sqlite3 /tmp/test.db "PRAGMA integrity_check;"' | grep -q "ok"; \
+	if [ $$? -eq 0 ]; then \
+		echo "✅ Backup integrity verified"; \
+	else \
+		echo "❌ Backup integrity check failed"; \
+		exit 1; \
+	fi
+
+# =============================================================================
+# Pre-deployment Backup Hook
+# =============================================================================
+
+.PHONY: pre-deploy-backup
+pre-deploy-backup: ## Create backup before deployment (called automatically by prod-deploy)
+	@echo "💾 Creating pre-deployment backup..."
+	@mkdir -p $(BACKUP_DIR)
+	@BACKUP_FILE="$(BACKUP_DIR)/comments_pre_deploy_$$(date +%Y%m%d_%H%M%S).db.gz"; \
+	docker-compose -f $(COMPOSE_PROD) exec -T $(BACKEND_SERVICE) sh -c 'sqlite3 $(SQLITE_DB) ".backup /tmp/comments_backup.db" && cat /tmp/comments_backup.db' | gzip > $$BACKUP_FILE; \
+	if [ $$? -eq 0 ]; then \
+		echo "✅ Pre-deployment backup created: $$BACKUP_FILE"; \
+	else \
+		echo "⚠️  Pre-deployment backup failed, but continuing with deployment..."; \
+	fi
+	@make backup-rotate
 
 # =============================================================================
 # SSL/Certificate Commands
@@ -261,7 +437,7 @@ help: ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep "logs" | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-25s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "Maintenance Commands:"
-	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E "(clean|backup|redis)" | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-25s\033[0m %s\n", $$1, $$2}'
+	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | grep -E "(clean|backup|redis|restore)" | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-25s\033[0m %s\n", $$1, $$2}'
 	@echo ""
 	@echo "Quick Start:"
 	@echo "  make prod-deploy          # Full production deployment"
