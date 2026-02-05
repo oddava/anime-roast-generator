@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { Search, X, Loader2 } from 'lucide-react';
+import { trackAnimeSearch, trackAnimeSelected, trackSearchFailed } from '../utils/analytics';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
 
@@ -36,12 +37,22 @@ function AnimeSearch({ onSelect, selectedAnime, disabled }) {
       const data = await response.json();
       const results = data.results || [];
       setSuggestions(results);
+      // Track successful search
+      trackAnimeSearch(searchQuery, results.length);
       // Auto-show suggestions when results come in and input is focused
       if (results.length > 0 && inputRef.current === document.activeElement) {
         setShowSuggestions(true);
       }
     } catch (err) {
       console.error('Search error:', err);
+      // Track failed search
+      let errorType = 'unknown';
+      if (err.message?.includes('Failed to fetch') || err.message?.includes('NetworkError')) {
+        errorType = 'network';
+      } else if (err.message?.includes('Failed to search')) {
+        errorType = 'api_error';
+      }
+      trackSearchFailed(searchQuery, errorType);
       // Provide more helpful error messages
       let errorMessage = 'Failed to search anime';
       if (err.message?.includes('Failed to fetch') || err.message?.includes('NetworkError')) {
@@ -83,6 +94,8 @@ function AnimeSearch({ onSelect, selectedAnime, disabled }) {
     setQuery(displayTitle);
     setShowSuggestions(false);
     onSelect(anime);
+    // Track anime selection
+    trackAnimeSelected(displayTitle, anime.id);
   };
 
   // Handle clearing selection

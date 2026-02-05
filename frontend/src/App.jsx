@@ -6,6 +6,15 @@ import StatsCard from './components/StatsCard';
 import SkeletonLoader from './components/SkeletonLoader';
 import RoastHistory, { MAX_HISTORY_ITEMS, STORAGE_KEY } from './components/RoastHistory';
 import CommentSection from './components/CommentSection';
+import { 
+  trackRoastGenerated, 
+  trackRoastGenerationFailed,
+  trackRoastCopied,
+  trackHistoryItemSelected,
+  setAnalyticsConsent,
+  getAnalyticsConsent 
+} from './utils/analytics';
+import CookieConsent from './components/CookieConsent';
 
 // API URL configuration for Vercel deployment
 // On Vercel, API is served from same origin, so we use relative path
@@ -25,6 +34,7 @@ function App() {
   const [error, setError] = useState('');
   const [toast, setToast] = useState('');
   const [roastHistory, setRoastHistory] = useState([]);
+  const [showCookieConsent, setShowCookieConsent] = useState(false);
 
   // Load history from localStorage on mount
   useEffect(() => {
@@ -36,6 +46,12 @@ function App() {
       } catch (e) {
         console.error('Failed to parse roast history:', e);
       }
+    }
+
+    // Check if user has made a cookie consent choice
+    const consent = getAnalyticsConsent();
+    if (consent === null) {
+      setShowCookieConsent(true);
     }
   }, []);
 
@@ -121,16 +137,29 @@ function App() {
       setReviewAnalysis(data.review_analysis);
       setReviewsUsed(data.reviews_used || 0);
 
+      // Track successful roast generation
+      trackRoastGenerated(data.anime_name, !!data.stats, data.reviews_used || 0);
+
       // Add to history
       addToHistory(data);
     } catch (err) {
+      let errorType = 'unknown';
       if (err.name === 'AbortError') {
+        errorType = 'timeout';
         setError('Request timed out. Please try again.');
       } else if (err.message?.includes('Failed to fetch') || err.message?.includes('NetworkError')) {
+        errorType = 'network';
         setError('Network error. Please check your connection and try again.');
+      } else if (err.message?.includes('Rate limit')) {
+        errorType = 'rate_limit';
+        setError(err.message);
       } else {
+        errorType = 'api_error';
         setError(err.message || 'Something went wrong. Please try again.');
       }
+      
+      // Track failed roast generation
+      trackRoastGenerationFailed(animeData.anime_name, errorType);
     } finally {
       clearTimeout(timeoutId);
       setLoading(false);
@@ -144,8 +173,10 @@ function App() {
       navigator.clipboard.writeText(roast);
       setToast('Roast copied to clipboard');
       setTimeout(() => setToast(''), 3000);
+      // Track copy event
+      trackRoastCopied(animeName);
     }
-  }, [roast]);
+  }, [roast, animeName]);
 
   const handleHistorySelect = useCallback((item) => {
     setAnimeName(item.animeName);
@@ -158,6 +189,8 @@ function App() {
     setError('');
     // Scroll to top to show the selected roast
     window.scrollTo({ top: 0, behavior: 'smooth' });
+    // Track history selection
+    trackHistoryItemSelected(item.animeName);
   }, []);
 
   const handleHistoryDelete = useCallback((id) => {
@@ -289,6 +322,20 @@ function App() {
           <Copy className="w-4 h-4 text-[#3b82f6]" />
           <span className="text-white">{toast}</span>
         </div>
+      )}
+
+      {/* Cookie Consent Banner */}
+      {showCookieConsent && (
+        <CookieConsent 
+          onAccept={() => {
+            setAnalyticsConsent(true);
+            setShowCookieConsent(false);
+          }}
+          onDecline={() => {
+            setAnalyticsConsent(false);
+            setShowCookieConsent(false);
+          }}
+        />
       )}
     </div>
   );

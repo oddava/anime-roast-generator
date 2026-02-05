@@ -3,6 +3,7 @@ import { Copy, Calendar, Film, Star, Tv } from 'lucide-react';
 import ReviewBadge from './ReviewBadge';
 import ReviewExcerpts from './ReviewExcerpts';
 import ShareButton from './ShareButton';
+import { trackRoastShared } from '../utils/analytics';
 
 function RoastDisplay({ 
   animeName, 

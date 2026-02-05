@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useCallback } from 'react';
 import { MessageSquare, ChevronUp, ChevronDown, MoreHorizontal, Edit2, Trash2 } from 'lucide-react';
 import { sanitizeContent } from '../utils/sanitize';
+import { trackCommentPosted, trackCommentVoted } from '../utils/analytics';
 
 const API_URL = import.meta.env.VITE_API_URL || '';
 const USERNAME_STORAGE_KEY = 'animeRoastUsername_v2';
@@ -461,6 +462,8 @@ const CommentSection = ({ animeId }) => {
       setComments(prev => [data, ...prev]);
       setTotalComments(prev => prev + 1);
       setNewComment('');
+      // Track comment posted
+      trackCommentPosted(false);
     } catch (err) {
       setError(err.message || 'Failed to post comment');
     } finally {
@@ -486,6 +489,10 @@ const CommentSection = ({ animeId }) => {
       }
       
       const data = await response.json();
+      
+      // Track vote
+      const voteTypeStr = voteType === 1 ? 'up' : voteType === -1 ? 'down' : 'remove';
+      trackCommentVoted(voteTypeStr);
       
       // Update comment in state
       const updateCommentVotes = (commentsList) => {
@@ -559,6 +566,8 @@ const CommentSection = ({ animeId }) => {
       
       setComments(prev => addReplyToParent(prev));
       setTotalComments(prev => prev + 1);
+      // Track reply posted
+      trackCommentPosted(true);
     } catch (err) {
       setError(err.message || 'Failed to post reply');
       throw err;
