@@ -12,17 +12,27 @@ RUN apt-get update && apt-get install -y \
 # Ensure CA certificates are up to date for HTTPS requests
 RUN update-ca-certificates
 
+# Install uv for faster package management
+RUN pip install --no-cache-dir uv
+
 # Copy requirements first for better caching
 COPY requirements.txt .
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Install Python dependencies using uv (much faster than pip)
+RUN uv pip install --system --no-cache -r requirements.txt
 
 # Copy application code
 COPY . .
 
 # Create non-root user for security
-RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+RUN useradd -m -u 1000 appuser
+
+# Create data directory for SQLite database with proper permissions
+RUN mkdir -p /app/data && chown -R appuser:appuser /app/data && chmod 755 /app/data
+
+# Set ownership for the rest of the app
+RUN chown -R appuser:appuser /app
+
 USER appuser
 
 # Expose port

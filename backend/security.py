@@ -1,6 +1,5 @@
 """Security middleware and utilities for the Anime Roast Generator API."""
 
-import re
 import logging
 import os
 import secrets
@@ -14,6 +13,8 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.types import ASGIApp
+
+from safe_regex import safe_regex_search, safe_regex_match, safe_regex_sub
 
 # Configure logging
 logging.basicConfig(
@@ -131,7 +132,7 @@ class SecurityManager:
     # Includes Unicode smart quotes (U+2018, U+2019) that AniList uses
     # Use explicit space character instead of \s to avoid allowing tabs/newlines
     # Includes forward slash for titles like "Fate/stay night"
-    ANIME_NAME_PATTERN = re.compile(r"^[\w '\u2018\u2019\-:!?.;,()/\[\]{}\"]{1,100}$")
+    ANIME_NAME_PATTERN = r"^[\w '\u2018\u2019\-:!?.;,()/\[\]{}\"]{1,100}$"
 
     # Forbidden patterns (potential injection attempts)
     # These patterns must be standalone SQL keywords, not part of normal words
@@ -204,16 +205,16 @@ class SecurityManager:
                 status_code=400, detail="Anime name too long (max 100 characters)"
             )
 
-        # Check for forbidden patterns (potential injection)
+        # Check for forbidden patterns (potential injection) using safe regex
         for pattern in cls.FORBIDDEN_PATTERNS:
-            if re.search(pattern, name, re.IGNORECASE):
+            if safe_regex_search(pattern, name, flags=0):
                 logger.warning(f"Potential injection attempt detected: {name[:50]}...")
                 raise HTTPException(
                     status_code=400, detail="Invalid characters in anime name"
                 )
 
-        # Validate against allowed pattern
-        if not cls.ANIME_NAME_PATTERN.match(name):
+        # Validate against allowed pattern using safe regex
+        if not safe_regex_match(cls.ANIME_NAME_PATTERN, name):
             raise HTTPException(
                 status_code=400, detail="Anime name contains invalid characters"
             )
@@ -246,13 +247,13 @@ class SecurityManager:
             if char == "\n" or (ord(char) >= 32 and ord(char) <= 126) or ord(char) > 127
         )
 
-        # Check for prompt injection attempts
+        # Check for prompt injection attempts using safe regex
         lower_text = text.lower()
         for pattern in cls.PROMPT_INJECTION_PATTERNS:
-            if re.search(pattern, lower_text):
+            if safe_regex_search(pattern, lower_text):
                 logger.warning("Potential prompt injection attempt detected")
                 # Remove the suspicious text section
-                text = re.sub(pattern, "[REMOVED]", text, flags=re.IGNORECASE)
+                text = safe_regex_sub(pattern, "[REMOVED]", text)
 
         # Escape special characters that could be used for injection
         text = text.replace("{", "{{").replace("}", "}}")
@@ -272,6 +273,15 @@ class SecurityManager:
         """
         if not review_context:
             return None
+
+        # Add size validation to prevent memory issues
+        context_size = len(str(review_context))
+        if context_size > 100_000:  # 100KB limit
+            logger.warning(
+                f"Review context too large: {context_size} bytes, truncating"
+            )
+            # Truncate large text fields
+            review_context = cls._truncate_large_fields(review_context)
 
         sanitized = {}
 
@@ -312,6 +322,54 @@ class SecurityManager:
                 sanitized["spicy_quotes"] = []
 
         return sanitized
+
+    @classmethod
+    def _truncate_large_fields(cls, review_context: dict) -> dict:
+        """Truncate large text fields in review context to reduce size.
+
+        Args:
+            review_context: Dictionary potentially containing large text fields
+
+        Returns:
+            Dictionary with truncated fields
+        """
+        truncated = review_context.copy()
+
+        # Truncate text fields that might be large
+        if "summary" in truncated and isinstance(truncated["summary"], str):
+            if len(truncated["summary"]) > 1000:
+                truncated["summary"] = truncated["summary"][:1000] + "..."
+
+        if "top_criticisms" in truncated and isinstance(
+            truncated["top_criticisms"], list
+        ):
+            # Limit to 3 criticisms and truncate each
+            truncated["top_criticisms"] = [
+                c[:200] + "..." if isinstance(c, str) and len(c) > 200 else c
+                for c in truncated["top_criticisms"][:3]
+            ]
+
+        if "spicy_quotes" in truncated and isinstance(truncated["spicy_quotes"], list):
+            # Limit to 1 quote and truncate
+            truncated["spicy_quotes"] = [
+                q[:200] + "..." if isinstance(q, str) and len(q) > 200 else q
+                for q in truncated["spicy_quotes"][:1]
+            ]
+
+        # Limit verified_complaints if present
+        if "verified_complaints" in truncated and isinstance(
+            truncated["verified_complaints"], list
+        ):
+            truncated["verified_complaints"] = truncated["verified_complaints"][:3]
+            for complaint in truncated["verified_complaints"]:
+                if isinstance(complaint, dict) and "examples" in complaint:
+                    complaint["examples"] = (
+                        complaint["examples"][:1]
+                        if isinstance(complaint["examples"], list)
+                        else []
+                    )
+
+        return truncated
 
     @classmethod
     def log_request(

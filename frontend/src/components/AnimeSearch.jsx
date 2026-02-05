@@ -11,6 +11,7 @@ function AnimeSearch({ onSelect, selectedAnime, disabled }) {
   const [error, setError] = useState('');
   const debounceTimer = useRef(null);
   const inputRef = useRef(null);
+  const containerRef = useRef(null);
 
   // Debounced search function
   const searchAnime = useCallback(async (searchQuery) => {
@@ -96,7 +97,7 @@ function AnimeSearch({ onSelect, selectedAnime, disabled }) {
   // Handle clicking outside to close suggestions
   useEffect(() => {
     const handleClickOutside = (event) => {
-      if (!event.target.closest('.anime-search-container')) {
+      if (containerRef.current && !containerRef.current.contains(event.target)) {
         setShowSuggestions(false);
       }
     };
@@ -132,7 +133,7 @@ function AnimeSearch({ onSelect, selectedAnime, disabled }) {
   };
 
   return (
-    <div className="anime-search-container relative w-full">
+    <div ref={containerRef} className="anime-search-container relative w-full">
       <div className="relative">
         <input
           ref={inputRef}

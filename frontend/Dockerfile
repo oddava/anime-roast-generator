@@ -1,19 +1,23 @@
-# Build stage
+# Build stage with pnpm for faster installs
 FROM node:20-alpine AS builder
+
+# Install pnpm globally
+RUN npm install -g pnpm
 
 WORKDIR /app
 
 # Copy package files
-COPY package*.json ./
+COPY package*.json pnpm-lock.yaml* ./
 
-# Install dependencies
-RUN npm install
+# Install dependencies using pnpm (faster than npm)
+# --frozen-lockfile ensures reproducible builds if lockfile exists
+RUN pnpm install --frozen-lockfile || pnpm install
 
 # Copy source code
 COPY . .
 
-# Build the application
-RUN npm run build
+# Build the application with optimizations
+RUN pnpm run build
 
 # Production stage
 FROM nginx:alpine

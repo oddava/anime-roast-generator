@@ -151,7 +151,16 @@ class AniListClient:
     """Client for interacting with AniList GraphQL API."""
 
     def __init__(self):
-        self.client = httpx.AsyncClient(timeout=10.0)
+        # Configure client with connection pooling and proper timeouts
+        timeout = httpx.Timeout(10.0, connect=5.0, read=10.0)
+        limits = httpx.Limits(
+            max_keepalive_connections=5, max_connections=10, keepalive_expiry=30.0
+        )
+        self.client = httpx.AsyncClient(
+            timeout=timeout,
+            limits=limits,
+            http2=False,  # HTTP/2 disabled - h2 package not installed
+        )
         self._last_request_time = None
         self._min_delay = (
             0.7  # Minimum delay between requests (AniList allows ~90 req/min)

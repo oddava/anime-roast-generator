@@ -5,6 +5,7 @@ import RoastDisplay from './components/RoastDisplay';
 import StatsCard from './components/StatsCard';
 import SkeletonLoader from './components/SkeletonLoader';
 import RoastHistory, { MAX_HISTORY_ITEMS, STORAGE_KEY } from './components/RoastHistory';
+import CommentSection from './components/CommentSection';
 
 // API URL configuration for Vercel deployment
 // On Vercel, API is served from same origin, so we use relative path
@@ -75,7 +76,7 @@ function App() {
 
     setLoading(true);
     setIsAnalyzing(true);
-    setLoadingPhase('Fetching anime data...');
+    setLoadingPhase('Crafting your roast...');
     setError('');
     setRoast('');
     setStats(null);
@@ -83,6 +84,9 @@ function App() {
     setAnimeDetails(null);
     setReviewAnalysis(null);
     setReviewsUsed(0);
+
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 35000); // 35s timeout
 
     try {
       const response = await fetch(`${API_URL}/api/generate-roast`, {
@@ -94,25 +98,19 @@ function App() {
           anime_name: animeData.anime_name,
           anime_id: animeData.anime_id
         }),
+        signal: controller.signal
       });
-
-      // Simulate loading phases for better UX
-      setLoadingPhase('Analyzing community reviews...');
-      await new Promise(resolve => setTimeout(resolve, 800));
-      
-      setLoadingPhase('Processing review data...');
-      await new Promise(resolve => setTimeout(resolve, 600));
-      
-      setLoadingPhase('Crafting your roast...');
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      clearTimeout(timeoutId);
 
       const data = await response.json();
 
       if (!response.ok) {
         if (response.status === 429) {
           throw new Error('Rate limit exceeded. Please wait a minute before trying again.');
+        } else if (response.status === 504) {
+          throw new Error('Request timed out. The AI is taking too long. Please try again.');
         }
-        throw new Error(data.detail || 'Failed to generate roast');
+        throw new Error(data.detail || data.error || 'Failed to generate roast');
       }
 
       setRoast(data.roast);
@@ -126,8 +124,15 @@ function App() {
       // Add to history
       addToHistory(data);
     } catch (err) {
-      setError(err.message || 'Something went wrong. Please try again.');
+      if (err.name === 'AbortError') {
+        setError('Request timed out. Please try again.');
+      } else if (err.message?.includes('Failed to fetch') || err.message?.includes('NetworkError')) {
+        setError('Network error. Please check your connection and try again.');
+      } else {
+        setError(err.message || 'Something went wrong. Please try again.');
+      }
     } finally {
+      clearTimeout(timeoutId);
       setLoading(false);
       setIsAnalyzing(false);
       setLoadingPhase('');
@@ -237,6 +242,13 @@ function App() {
             onDelete={handleHistoryDelete}
             onClearAll={handleClearAllHistory}
           />
+
+          {/* Comment Section */}
+          {animeDetails?.id && (
+            <div className="animate-slide-up" style={{ animationDelay: '200ms' }}>
+              <CommentSection animeId={animeDetails.id} />
+            </div>
+          )}
         </div>
       </main>
 

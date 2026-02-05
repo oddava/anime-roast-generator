@@ -1,13 +1,13 @@
 import logging
 import json
 import re
-import hashlib
-import time
 import os
 import asyncio
+import hashlib
 from typing import Optional
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -23,6 +23,16 @@ from models import (
     AnimeSearchResult,
     AnimeDetails,
     ReviewAnalysis,
+    CommentCreate,
+    CommentResponse,
+    CommentListResponse,
+    ThreadedCommentResponse,
+    ThreadedCommentListResponse,
+    CommentReplyRequest,
+    CommentVoteRequest,
+    CommentVoteResponse,
+    CommentEditRequest,
+    CommentEditResponse,
 )
 from security import (
     SecurityManager,
@@ -31,10 +41,41 @@ from security import (
     RequestIDMiddleware,
     RateLimitInfoMiddleware,
 )
-from anilist_client import get_anilist_client, close_anilist_client
+from anilist_client import AniListClient
 from enhanced_review_analyzer import EnhancedReviewAnalyzer
 from simple_context_builder import SimpleContextBuilder
 from roast_cleaner import RoastCleaner
+from cache import get_cache
+from database import init_db, get_db, Comment, CommentVote
+from name_generator import generate_random_name, hash_ip
+from spam_detector import check_spam
+from datetime import datetime, timedelta
+from sqlalchemy.orm import Session
+from fastapi import Depends
+from constants import (
+    ROAST_RATE_LIMIT_PER_MINUTE,
+    SEARCH_RATE_LIMIT_PER_MINUTE,
+    ANIME_DETAILS_RATE_LIMIT_PER_MINUTE,
+    COMMENT_CREATE_RATE_LIMIT_PER_MINUTE,
+    COMMENT_VOTE_RATE_LIMIT_PER_MINUTE,
+    COMMENT_EDIT_RATE_LIMIT_PER_MINUTE,
+    COMMENT_DELETE_RATE_LIMIT_PER_MINUTE,
+    MAX_COMMENT_LENGTH,
+    MAX_AUTHOR_NAME_LENGTH,
+    COMMENT_EDIT_TIME_LIMIT_SECONDS,
+    MAX_COMMENT_DEPTH,
+    DEFAULT_COMMENTS_PER_PAGE,
+    MAX_COMMENTS_PER_PAGE,
+    MIN_SEARCH_QUERY_LENGTH,
+    MAX_SEARCH_QUERY_LENGTH,
+    DEFAULT_SEARCH_RESULTS,
+    MAX_SEARCH_RESULTS,
+    MAX_ANIME_NAME_LENGTH,
+    GEMINI_API_TIMEOUT_SECONDS,
+    MAX_ROAST_RETRIES,
+    DEFAULT_STATS,
+    FRONTEND_API_TIMEOUT_MS,
+)
 
 
 # Configure structured logging
@@ -99,46 +140,31 @@ limiter = get_limiter()
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Add response compression middleware
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
 # Configure Gemini with timeout
 if settings.gemini_api_key:
     genai.configure(api_key=settings.gemini_api_key)
 else:
     logger.error("GEMINI_API_KEY not set!")
 
-# Simple in-memory cache for Gemini responses
-_response_cache = {}
-CACHE_TTL = 3600  # 1 hour
+# Initialize cache
+_cache = get_cache()
 
 
-def get_cached_response(cache_key: str) -> Optional[dict]:
-    """Get cached response if not expired."""
-    if cache_key in _response_cache:
-        cached_data, timestamp = _response_cache[cache_key]
-        if time.time() - timestamp < CACHE_TTL:
-            logger.info(f"Cache hit for key: {cache_key[:16]}...")
-            return cached_data
-        else:
-            del _response_cache[cache_key]
-    return None
-
-
-def set_cached_response(cache_key: str, data: dict):
-    """Cache response with timestamp."""
-    _response_cache[cache_key] = (data, time.time())
-    # Clean old cache entries periodically
-    if len(_response_cache) > 1000:
-        current_time = time.time()
-        expired_keys = [
-            k for k, (_, ts) in _response_cache.items() if current_time - ts > CACHE_TTL
-        ]
-        for k in expired_keys:
-            del _response_cache[k]
+# Initialize database on startup
+@app.on_event("startup")
+async def startup_event():
+    """Initialize database on application startup."""
+    init_db()
+    logger.info("Database initialized")
 
 
 def generate_cache_key(anime_name: str, review_context: Optional[dict]) -> str:
-    """Generate cache key from request data."""
+    """Generate cache key from request data using deterministic hash."""
     key_data = f"{anime_name}:{json.dumps(review_context, sort_keys=True) if review_context else 'none'}"
-    return hashlib.sha256(key_data.encode()).hexdigest()
+    return hashlib.sha256(key_data.encode()).hexdigest()[:32]  # Deterministic hash
 
 
 def generate_roast_and_stats_prompt(
@@ -223,14 +249,7 @@ def parse_roast_response(response_text: str) -> tuple[str, dict]:
 
 def _get_default_stats() -> dict:
     """Get default stats."""
-    return {
-        "horniness_level": 50,
-        "plot_armor_thickness": 50,
-        "filler_hell": 50,
-        "power_creep": 50,
-        "cringe_factor": 50,
-        "fan_toxicity": 50,
-    }
+    return DEFAULT_STATS.copy()
 
 
 @app.get("/")
@@ -250,17 +269,21 @@ async def health_check():
 
 
 @app.get("/api/search-anime")
-@limiter.limit("30/minute")
+@limiter.limit(f"{SEARCH_RATE_LIMIT_PER_MINUTE}/minute")
 async def search_anime(request: Request, q: str = ""):
     """
     Search for anime titles as user types.
     Rate limited to 30 requests per minute per IP.
     """
-    if not q or len(q.strip()) < 2:
+    if not q or len(q.strip()) < MIN_SEARCH_QUERY_LENGTH:
         return {"results": [], "query": q}
 
+    if len(q) > MAX_SEARCH_QUERY_LENGTH:
+        raise HTTPException(status_code=400, detail="Search query too long")
+
+    client = None
     try:
-        client = get_anilist_client()
+        client = AniListClient()
         results = await client.search_anime(q.strip(), per_page=10)
         anime_results = [AnimeSearchResult(**result) for result in results]
 
@@ -275,14 +298,18 @@ async def search_anime(request: Request, q: str = ""):
         raise HTTPException(
             status_code=500, detail="Failed to search anime. Please try again later."
         )
+    finally:
+        if client:
+            await client.close()
 
 
 @app.get("/api/anime/{anime_id}")
 @limiter.limit("30/minute")
 async def get_anime_details(request: Request, anime_id: int):
     """Get detailed information about a specific anime by AniList ID."""
+    client = None
     try:
-        client = get_anilist_client()
+        client = AniListClient()
         anime = await client.get_anime_by_id(anime_id)
 
         if not anime:
@@ -301,10 +328,13 @@ async def get_anime_details(request: Request, anime_id: int):
             status_code=500,
             detail="Failed to fetch anime details. Please try again later.",
         )
+    finally:
+        if client:
+            await client.close()
 
 
 @app.post("/api/generate-roast", response_model=RoastResponse)
-@limiter.limit("10/minute")
+@limiter.limit(f"{ROAST_RATE_LIMIT_PER_MINUTE}/minute")
 async def generate_roast(request: Request, roast_request: RoastRequest):
     """
     Generate a roast and stats for the specified anime.
@@ -325,9 +355,10 @@ async def generate_roast(request: Request, roast_request: RoastRequest):
         enhanced_context = None
         reviews_used = 0
 
+        client = None
         if roast_request.anime_id:
             try:
-                client = get_anilist_client()
+                client = AniListClient()
                 anime_data = await client.get_anime_by_id(roast_request.anime_id)
                 if anime_data:
                     anime_id = roast_request.anime_id
@@ -352,10 +383,13 @@ async def generate_roast(request: Request, roast_request: RoastRequest):
                     enhanced_context = None
             except Exception as e:
                 logger.warning(f"[{request_id}] Could not fetch details: {e}")
+            finally:
+                if client:
+                    await client.close()
 
         # Check cache first
         cache_key = generate_cache_key(anime_name, enhanced_context)
-        cached_response = get_cached_response(cache_key)
+        cached_response = await _cache.get(cache_key)
 
         if cached_response:
             logger.info(f"[{request_id}] Returning cached response")
@@ -376,16 +410,17 @@ async def generate_roast(request: Request, roast_request: RoastRequest):
             anime_name, anime_data, enhanced_context
         )
 
-        max_retries = 2
+        max_retries = MAX_ROAST_RETRIES
         roast_text = None
         stats_data = None
         validation_issues = []
 
         for attempt in range(max_retries + 1):
             try:
-                # Add 30 second timeout for Gemini API
+                # Add timeout for Gemini API
                 response = await asyncio.wait_for(
-                    asyncio.to_thread(model.generate_content, prompt), timeout=30.0
+                    asyncio.to_thread(model.generate_content, prompt),
+                    timeout=GEMINI_API_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
                 logger.error(
@@ -450,7 +485,7 @@ async def generate_roast(request: Request, roast_request: RoastRequest):
             "roast": roast_text,
             "stats": stats.dict(),
         }
-        set_cached_response(cache_key, response_data)
+        await _cache.set(cache_key, response_data)
 
         SecurityManager.log_request(request, anime_name, success=True)
 
@@ -502,6 +537,592 @@ async def generate_roast(request: Request, roast_request: RoastRequest):
         raise HTTPException(
             status_code=500,
             detail="Failed to generate roast. Please try again later.",
+        )
+
+
+def build_comment_tree(
+    comments: list, user_ip_hash: str, db: Session, max_depth: int = 3
+) -> list:
+    """Build threaded comment tree structure with optimized vote fetching."""
+    comment_map = {}
+    root_comments = []
+
+    # Batch fetch all user votes in a single query to avoid N+1
+    comment_ids = [c.id for c in comments]
+    votes_map = {}
+    if comment_ids:
+        votes = (
+            db.query(CommentVote.comment_id, CommentVote.vote_type)
+            .filter(
+                CommentVote.comment_id.in_(comment_ids),
+                CommentVote.ip_hash == user_ip_hash,
+            )
+            .all()
+        )
+        votes_map = {vote.comment_id: vote.vote_type for vote in votes}
+
+    # First pass: create map and identify roots
+    for comment in comments:
+        user_vote = votes_map.get(comment.id)
+        comment_data = ThreadedCommentResponse(
+            id=comment.id,
+            anime_id=comment.anime_id,
+            parent_id=comment.parent_id,
+            content=comment.content if not comment.is_deleted else "[deleted]",
+            author_name=comment.author_name if not comment.is_deleted else "[deleted]",
+            created_at=comment.created_at.isoformat(),
+            updated_at=comment.updated_at.isoformat(),
+            is_deleted=comment.is_deleted,
+            is_edited=comment.is_edited,
+            upvotes=comment.upvotes,
+            downvotes=comment.downvotes,
+            score=comment.score,
+            depth=comment.depth,
+            reply_count=comment.reply_count,
+            user_vote=user_vote,
+            replies=[],
+        )
+        comment_map[comment.id] = comment_data
+        if comment.parent_id is None:
+            root_comments.append(comment_data)
+
+    # Second pass: build tree
+    for comment in comments:
+        if comment.parent_id and comment.parent_id in comment_map:
+            parent = comment_map[comment.parent_id]
+            child = comment_map[comment.id]
+            # Only include replies if depth allows
+            if child.depth <= max_depth:
+                parent.replies.append(child)
+
+    return root_comments
+
+
+@app.get("/api/anime/{anime_id}/comments", response_model=ThreadedCommentListResponse)
+@limiter.limit("60/minute")
+async def get_comments(
+    request: Request,
+    anime_id: int,
+    db: Session = Depends(get_db),
+    sort: str = "best",
+    cursor: Optional[str] = None,
+    limit: int = 20,
+):
+    """
+    Get threaded comments for a specific anime.
+    Rate limited to 60 requests per minute per IP.
+
+    Sort options:
+    - best: Wilson score (default)
+    - new: Chronological, newest first
+    - top: Highest score
+    """
+    try:
+        # Validate parameters
+        limit = min(max(limit, 1), 50)
+        if sort not in ["best", "new", "top"]:
+            sort = "best"
+
+        # Get client IP for vote tracking
+        client_ip = request.client.host if request.client else "unknown"
+        ip_hash = hash_ip(client_ip)
+
+        # Build query for root comments only
+        query = db.query(Comment).filter(
+            Comment.anime_id == anime_id, Comment.parent_id == None
+        )
+
+        # Apply sorting
+        if sort == "new":
+            query = query.order_by(Comment.created_at.desc())
+        elif sort == "top":
+            query = query.order_by(Comment.score.desc(), Comment.created_at.desc())
+        else:  # best
+            # Simple score-based sorting for now (can be improved with Wilson score)
+            query = query.order_by(Comment.score.desc(), Comment.created_at.desc())
+
+        # Cursor-based pagination
+        if cursor:
+            try:
+                cursor_id = int(cursor)
+                if sort == "new":
+                    query = query.filter(Comment.id < cursor_id)
+                else:
+                    query = query.filter(Comment.id < cursor_id)
+            except ValueError:
+                pass
+
+        # Get root comments
+        root_comments = query.limit(limit + 1).all()
+        has_more = len(root_comments) > limit
+        root_comments = root_comments[:limit]
+
+        # Get all replies for these root comments
+        root_ids = [c.id for c in root_comments]
+        if root_ids:
+            # Get all descendants using path-based query
+            all_comments = root_comments.copy()
+
+            # Get direct replies (depth 1)
+            replies = (
+                db.query(Comment)
+                .filter(Comment.parent_id.in_(root_ids))
+                .order_by(Comment.score.desc(), Comment.created_at.desc())
+                .all()
+            )
+            all_comments.extend(replies)
+
+            # Get nested replies (depth 2+)
+            reply_ids = [r.id for r in replies]
+            if reply_ids:
+                nested = (
+                    db.query(Comment)
+                    .filter(Comment.parent_id.in_(reply_ids))
+                    .order_by(Comment.score.desc(), Comment.created_at.desc())
+                    .all()
+                )
+                all_comments.extend(nested)
+
+                # Continue for deeper nesting
+                nested_ids = [n.id for n in nested]
+                if nested_ids:
+                    deeper = (
+                        db.query(Comment)
+                        .filter(Comment.parent_id.in_(nested_ids))
+                        .order_by(Comment.score.desc(), Comment.created_at.desc())
+                        .limit(100)
+                        .all()
+                    )
+                    all_comments.extend(deeper)
+        else:
+            all_comments = root_comments
+
+        # Build tree structure
+        comment_tree = build_comment_tree(all_comments, ip_hash, db)
+
+        # Get total count
+        total = db.query(Comment).filter(Comment.anime_id == anime_id).count()
+
+        return ThreadedCommentListResponse(
+            comments=comment_tree, total=total, anime_id=anime_id, has_more=has_more
+        )
+
+    except Exception as e:
+        logger.error(f"Error fetching comments for anime {anime_id}: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to fetch comments. Please try again later.",
+        )
+
+
+@app.post("/api/anime/{anime_id}/comments", response_model=ThreadedCommentResponse)
+@limiter.limit("5/minute")
+async def create_comment(
+    request: Request,
+    anime_id: int,
+    comment_data: CommentCreate,
+    db: Session = Depends(get_db),
+):
+    """
+    Create a new root comment for an anime.
+    Rate limited to 5 comments per minute per IP.
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+
+    try:
+        client_ip = request.client.host if request.client else "unknown"
+        ip_hash = hash_ip(client_ip)
+
+        # Generate or use provided author name
+        author_name = comment_data.author_name or generate_random_name()
+        if len(author_name) > 50:
+            author_name = author_name[:50]
+
+        # Check for spam using advanced detection
+        is_spam, reason = await check_spam(
+            db, ip_hash, comment_data.content, author_name
+        )
+        if is_spam:
+            raise HTTPException(status_code=429, detail=reason)
+
+        # Create new comment
+        new_comment = Comment(
+            anime_id=anime_id,
+            content=comment_data.content,
+            author_name=author_name,
+            ip_hash=ip_hash,
+            depth=0,
+            path=str(anime_id),
+        )
+
+        try:
+            db.add(new_comment)
+            db.flush()  # Flush to get the ID without committing
+            new_comment.path = f"{anime_id}/{new_comment.id}"
+            db.commit()
+            db.refresh(new_comment)
+        except Exception:
+            db.rollback()
+            raise
+
+        logger.info(
+            f"[{request_id}] Created comment {new_comment.id} for anime {anime_id}"
+        )
+
+        return ThreadedCommentResponse(
+            id=new_comment.id,
+            anime_id=new_comment.anime_id,
+            parent_id=new_comment.parent_id,
+            content=new_comment.content,
+            author_name=new_comment.author_name,
+            created_at=new_comment.created_at.isoformat(),
+            updated_at=new_comment.updated_at.isoformat(),
+            is_deleted=new_comment.is_deleted,
+            is_edited=new_comment.is_edited,
+            upvotes=new_comment.upvotes,
+            downvotes=new_comment.downvotes,
+            score=new_comment.score,
+            depth=new_comment.depth,
+            reply_count=new_comment.reply_count,
+            user_vote=None,
+            replies=[],
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] Error creating comment: {e}")
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create comment. Please try again later.",
+        )
+
+
+@app.post("/api/comments/{comment_id}/reply", response_model=ThreadedCommentResponse)
+@limiter.limit("5/minute")
+async def reply_to_comment(
+    request: Request,
+    comment_id: int,
+    reply_data: CommentReplyRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Reply to an existing comment.
+    Rate limited to 5 replies per minute per IP.
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+
+    try:
+        client_ip = request.client.host if request.client else "unknown"
+        ip_hash = hash_ip(client_ip)
+
+        # Find parent comment
+        parent = db.query(Comment).filter(Comment.id == comment_id).first()
+        if not parent:
+            raise HTTPException(status_code=404, detail="Parent comment not found")
+
+        # Use provided author name or generate new one
+        author_name = reply_data.author_name or generate_random_name()
+        if len(author_name) > 50:
+            author_name = author_name[:50]
+
+        # Check for spam using advanced detection
+        is_spam, reason = await check_spam(db, ip_hash, reply_data.content, author_name)
+        if is_spam:
+            raise HTTPException(status_code=429, detail=reason)
+
+        # Create reply
+        reply = Comment(
+            anime_id=parent.anime_id,
+            parent_id=parent.id,
+            content=reply_data.content,
+            author_name=author_name,
+            ip_hash=ip_hash,
+            depth=parent.depth + 1,
+            path=f"{parent.path}/{parent.id}",
+        )
+
+        try:
+            db.add(reply)
+            db.flush()  # Flush to get the ID without committing
+
+            # Update parent's reply count
+            parent.reply_count += 1
+
+            # Update path with reply ID
+            reply.path = f"{parent.path}/{reply.id}"
+
+            db.commit()
+            db.refresh(reply)
+        except Exception:
+            db.rollback()
+            raise
+
+        logger.info(f"[{request_id}] Created reply {reply.id} to comment {comment_id}")
+
+        return ThreadedCommentResponse(
+            id=reply.id,
+            anime_id=reply.anime_id,
+            parent_id=reply.parent_id,
+            content=reply.content,
+            author_name=reply.author_name,
+            created_at=reply.created_at.isoformat(),
+            updated_at=reply.updated_at.isoformat(),
+            is_deleted=reply.is_deleted,
+            is_edited=reply.is_edited,
+            upvotes=reply.upvotes,
+            downvotes=reply.downvotes,
+            score=reply.score,
+            depth=reply.depth,
+            reply_count=reply.reply_count,
+            user_vote=None,
+            replies=[],
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] Error creating reply: {e}")
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to create reply. Please try again later.",
+        )
+
+
+@app.post("/api/comments/{comment_id}/vote", response_model=CommentVoteResponse)
+@limiter.limit("10/minute")
+async def vote_comment(
+    request: Request,
+    comment_id: int,
+    vote_data: CommentVoteRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Vote on a comment (upvote/downvote).
+    Rate limited to 10 votes per minute per IP.
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+
+    try:
+        client_ip = request.client.host if request.client else "unknown"
+        ip_hash = hash_ip(client_ip)
+
+        # Find comment with lock to prevent race conditions
+        comment = (
+            db.query(Comment).filter(Comment.id == comment_id).with_for_update().first()
+        )
+        if not comment:
+            raise HTTPException(status_code=404, detail="Comment not found")
+
+        # Prevent self-voting
+        if comment.ip_hash == ip_hash:
+            raise HTTPException(
+                status_code=403, detail="Cannot vote on your own comment"
+            )
+
+        # Check existing vote
+        existing_vote = (
+            db.query(CommentVote)
+            .filter(
+                CommentVote.comment_id == comment_id, CommentVote.ip_hash == ip_hash
+            )
+            .first()
+        )
+
+        if vote_data.vote_type == 0:
+            # Remove vote
+            if existing_vote:
+                if existing_vote.vote_type == 1:
+                    comment.upvotes -= 1
+                else:
+                    comment.downvotes -= 1
+                db.delete(existing_vote)
+        else:
+            # Add or update vote
+            if existing_vote:
+                if existing_vote.vote_type == vote_data.vote_type:
+                    # Same vote, remove it (toggle)
+                    if vote_data.vote_type == 1:
+                        comment.upvotes -= 1
+                    else:
+                        comment.downvotes -= 1
+                    db.delete(existing_vote)
+                    vote_data.vote_type = 0
+                else:
+                    # Change vote
+                    if existing_vote.vote_type == 1:
+                        comment.upvotes -= 1
+                        comment.downvotes += 1
+                    else:
+                        comment.downvotes -= 1
+                        comment.upvotes += 1
+                    existing_vote.vote_type = vote_data.vote_type
+            else:
+                # New vote
+                new_vote = CommentVote(
+                    comment_id=comment_id,
+                    ip_hash=ip_hash,
+                    vote_type=vote_data.vote_type,
+                )
+                db.add(new_vote)
+                if vote_data.vote_type == 1:
+                    comment.upvotes += 1
+                else:
+                    comment.downvotes += 1
+
+        # Update score
+        comment.score = comment.upvotes - comment.downvotes
+
+        db.commit()
+
+        logger.info(
+            f"[{request_id}] Vote on comment {comment_id}: {vote_data.vote_type}"
+        )
+
+        return CommentVoteResponse(
+            comment_id=comment_id,
+            upvotes=comment.upvotes,
+            downvotes=comment.downvotes,
+            score=comment.score,
+            user_vote=vote_data.vote_type,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] Error voting: {e}")
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to vote. Please try again later.",
+        )
+
+
+@app.put("/api/comments/{comment_id}", response_model=ThreadedCommentResponse)
+@limiter.limit("5/minute")
+async def edit_comment(
+    request: Request,
+    comment_id: int,
+    edit_data: CommentEditRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Edit a comment (only own comments, within 15 minutes of creation).
+    Rate limited to 5 edits per minute per IP.
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+
+    try:
+        client_ip = request.client.host if request.client else "unknown"
+        ip_hash = hash_ip(client_ip)
+
+        # Find comment
+        comment = db.query(Comment).filter(Comment.id == comment_id).first()
+        if not comment:
+            raise HTTPException(status_code=404, detail="Comment not found")
+
+        # Check ownership
+        if comment.ip_hash != ip_hash:
+            raise HTTPException(
+                status_code=403, detail="Cannot edit other users' comments"
+            )
+
+        # Check time limit (15 minutes)
+        time_since_creation = datetime.utcnow() - comment.created_at
+        if time_since_creation.total_seconds() > COMMENT_EDIT_TIME_LIMIT_SECONDS:
+            raise HTTPException(
+                status_code=403,
+                detail="Comments can only be edited within 15 minutes of creation",
+            )
+
+        # Update comment
+        comment.content = edit_data.content
+        comment.is_edited = 1
+        comment.updated_at = datetime.utcnow()
+
+        db.commit()
+
+        logger.info(f"[{request_id}] Edited comment {comment_id}")
+
+        return ThreadedCommentResponse(
+            id=comment.id,
+            anime_id=comment.anime_id,
+            parent_id=comment.parent_id,
+            content=comment.content,
+            author_name=comment.author_name,
+            created_at=comment.created_at.isoformat(),
+            updated_at=comment.updated_at.isoformat(),
+            is_deleted=comment.is_deleted,
+            is_edited=comment.is_edited,
+            upvotes=comment.upvotes,
+            downvotes=comment.downvotes,
+            score=comment.score,
+            depth=comment.depth,
+            reply_count=comment.reply_count,
+            user_vote=None,
+            replies=[],
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] Error editing comment: {e}")
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to edit comment. Please try again later.",
+        )
+
+
+@app.delete("/api/comments/{comment_id}")
+@limiter.limit("5/minute")
+async def delete_comment(
+    request: Request,
+    comment_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Soft delete a comment (only own comments).
+    Rate limited to 5 deletions per minute per IP.
+    """
+    request_id = getattr(request.state, "request_id", "unknown")
+
+    try:
+        client_ip = request.client.host if request.client else "unknown"
+        ip_hash = hash_ip(client_ip)
+
+        # Find comment
+        comment = db.query(Comment).filter(Comment.id == comment_id).first()
+        if not comment:
+            raise HTTPException(status_code=404, detail="Comment not found")
+
+        # Check ownership
+        if comment.ip_hash != ip_hash:
+            raise HTTPException(
+                status_code=403, detail="Cannot delete other users' comments"
+            )
+
+        # Soft delete
+        comment.is_deleted = 1
+        comment.content = "[deleted]"
+        comment.author_name = "[deleted]"
+
+        db.commit()
+
+        logger.info(f"[{request_id}] Deleted comment {comment_id}")
+
+        return {"success": True, "message": "Comment deleted"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[{request_id}] Error deleting comment: {e}")
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to delete comment. Please try again later.",
         )
 
 
